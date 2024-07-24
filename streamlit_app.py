@@ -1,56 +1,109 @@
+from langchain.document_loaders import DirectoryLoader
+from langchain.text_splitter import CharacterTextSplitter
+import os
+from pinecone import Pinecone, PodSpec, ServerlessSpec
+from langchain.vectorstores import Pinecone as LangchainPinecone
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.chat_models import ChatOpenAI
 import streamlit as st
-from openai import OpenAI
+from dotenv import load_dotenv
+import time
+import pillow_heif
+import unstructured_inference
+import unstructured_pytesseract
+import pytesseract
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+# Ensure tesseract is found
+pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+load_dotenv()
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+PINECONE_API_KEY = os.getenv('PINECONE_API_KEY')
+PINECONE_ENV = os.getenv('PINECONE_ENV')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+USE_SERVERLESS = os.getenv('USE_SERVERLESS', 'true').lower() == 'true'
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+def doc_preprocessing():
+    loader = DirectoryLoader(
+        '/content/data/',
+        glob='**/*.pdf',     # only the PDFs
+        show_progress=True
+    )
+    docs = loader.load()
+    text_splitter = CharacterTextSplitter(
+        chunk_size=1000, 
+        chunk_overlap=0
+    )
+    docs_split = text_splitter.split_documents(docs)
+    return docs_split
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+@st.cache_resource
+def embedding_db():
+    # Initialize Pinecone
+    pc = Pinecone(api_key=PINECONE_API_KEY)
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    if USE_SERVERLESS:
+        spec = ServerlessSpec(cloud='aws', region='us-west-2')
+    else:
+        # Ensure PINECONE_ENV is set for non-serverless configurations
+        if not PINECONE_ENV:
+            raise ValueError("PINECONE_ENV must be set when not using serverless configuration.")
+        spec = PodSpec(environment=PINECONE_ENV)
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
+    # Define the index name
+    index_name = "stre"
+
+    # Check if index already exists
+    if index_name not in pc.list_indexes().names():
+        # If it does not exist, create index
+        pc.create_index(
+            name=index_name,
+            dimension=1536,  # dimensionality of text-embedding-ada-002
+            metric='cosine',
+            spec=spec
         )
+        # Wait for index to be initialized
+        time.sleep(1)
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    # Connect to index
+    index = pc.Index(index_name)
+    index.describe_index_stats()
+
+    # We use the OpenAI embedding model
+    embeddings = OpenAIEmbeddings()
+    docs_split = doc_preprocessing()
+    doc_db = LangchainPinecone.from_documents(
+        docs_split, 
+        embeddings, 
+        index_name=index_name
+    )
+    return doc_db
+
+llm = ChatOpenAI()
+doc_db = embedding_db()
+
+def retrieval_answer(query):
+    qa = RetrievalQA.from_chain_type(
+        llm=llm, 
+        chain_type='stuff',
+        retriever=doc_db.as_retriever(),
+    )
+    query = query
+    result = qa.run(query)
+    return result
+
+def main():
+    st.title("Question and Answering App powered by LLM and Pinecone")
+
+    text_input = st.text_input("Ask your query...") 
+    if st.button("Ask Query"):
+        if len(text_input) > 0:
+            st.info("Your Query: " + text_input)
+            answer = retrieval_answer(text_input)
+            st.success(answer)
+
+if __name__ == "__main__":
+    main()
