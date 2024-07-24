@@ -9,5 +9,6 @@ faiss-cpu
 unstructured_pytesseract
 unstructured_inference
 tiktoken
-pypdf2 openpyxl unstructured
+poppler-utils
 pillow_heif
+langchain-community
